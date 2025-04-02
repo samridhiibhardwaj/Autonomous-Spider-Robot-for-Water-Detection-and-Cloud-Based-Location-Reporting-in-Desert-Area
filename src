@@ -1,0 +1,150 @@
+import time
+import serial
+import cv2
+import requests
+import paho.mqtt.client as mqtt
+from gpiozero import LED
+import RPi.GPIO as GPIO
+import logging
+import numpy as np
+
+# -------------------- CONFIGURATION --------------------
+# GPIO Pins (adjust as needed for hardware)
+LED_PIN = 24  # Status LED
+
+# GPS Configuration
+GPS_SERIAL_PORT = '/dev/ttyS0'
+
+# Cloud Configuration
+CLOUD_BROKER = "mqtt.cloudprovider.com"
+CLOUD_PORT = 1883
+CLOUD_TOPIC = "desert_robot/water_report"
+CLOUD_API_URL = "https://api.cloudprovider.com/report"
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(filename='robot.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# -------------------- MQTT CLIENT SETUP --------------------
+client = mqtt.Client()
+
+def connect_to_cloud():
+    try:
+        client.connect(CLOUD_BROKER, CLOUD_PORT, 60)
+        client.loop_start()
+        logging.info("Connected to MQTT Broker!")
+    except Exception as e:
+        logging.error(f"MQTT connection error: {e}")
+
+# -------------------- GPS HANDLING --------------------
+def read_gps():
+    try:
+        ser = serial.Serial(GPS_SERIAL_PORT, 9600, timeout=1)
+        data = ser.readline().decode('ascii', errors='replace')
+        ser.close()
+        if data.startswith('$GPGGA'):
+            parts = data.split(',')
+            if len(parts) > 2:
+                latitude = float(parts[2]) / 100
+                longitude = float(parts[4]) / 100
+                logging.info(f"GPS Data: Latitude={latitude}, Longitude={longitude}")
+                return {"lat": latitude, "lon": longitude}
+    except Exception as e:
+        logging.error(f"GPS Error: {e}")
+    return {"lat": 0.0, "lon": 0.0}
+
+# -------------------- IMAGE RECOGNITION FOR WATER DETECTION --------------------
+def detect_water(frame):
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Simple thresholding to detect water bodies
+        _, threshold = cv2.threshold(blur, 50, 255, cv2.THRESH_BINARY)
+        white_pixels = cv2.countNonZero(threshold)
+
+        logging.info(f"White pixels detected: {white_pixels}")
+
+        # Threshold for water detection
+        return white_pixels > 10000
+    except Exception as e:
+        logging.error(f"Image Processing Error: {e}")
+        return False
+
+# -------------------- CLOUD REPORTING --------------------
+def send_data_to_cloud(gps_data, water_status):
+    payload = {
+        "latitude": gps_data['lat'],
+        "longitude": gps_data['lon'],
+        "water_detected": water_status
+    }
+    try:
+        client.publish(CLOUD_TOPIC, str(payload))
+        response = requests.post(CLOUD_API_URL, json=payload)
+        if response.status_code == 200:
+            logging.info("Data sent to cloud successfully!")
+        else:
+            logging.warning("Failed to send data via API.")
+    except Exception as e:
+        logging.error(f"Cloud Reporting Error: {e}")
+
+# -------------------- LED STATUS --------------------
+def update_led_status(water_detected):
+    led = LED(LED_PIN)
+    if water_detected:
+        led.on()
+        logging.info("LED ON - Water Detected")
+    else:
+        led.off()
+        logging.info("LED OFF - No Water Detected")
+
+# -------------------- IMAGE CAPTURE & PROCESSING --------------------
+def capture_image():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Camera not detected!")
+        return None
+
+    ret, frame = cap.read()
+    cap.release()
+
+    if ret:
+        logging.info("Image captured successfully.")
+        return frame
+    else:
+        logging.warning("Failed to capture image.")
+        return None
+
+# -------------------- MAIN LOOP --------------------
+def main():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(LED_PIN, GPIO.OUT)
+    connect_to_cloud()
+
+    try:
+        while True:
+            logging.info("Starting new iteration...")
+
+            gps_data = read_gps()
+            frame = capture_image()
+
+            if frame is not None:
+                water_status = detect_water(frame)
+                logging.info(f"GPS: {gps_data}, Water Detected: {water_status}")
+
+                update_led_status(water_status)
+                send_data_to_cloud(gps_data, water_status)
+            else:
+                logging.warning("No image to process.")
+
+            time.sleep(10)  # Delay before next iteration
+
+    except KeyboardInterrupt:
+        logging.warning("Shutting down due to keyboard interrupt...")
+    finally:
+        client.loop_stop()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
